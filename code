@@ -1,0 +1,668 @@
+import os
+import re
+import io
+from collections import defaultdict, Counter
+from datetime import datetime
+
+import pandas as pd
+from flask import Flask, request, render_template_string, send_file
+
+UPLOAD = 'uploads'
+OUTPUT = 'outputs'
+os.makedirs(UPLOAD, exist_ok=True)
+os.makedirs(OUTPUT, exist_ok=True)
+app = Flask(__name__)
+
+# ---------------- 工具：正则提取周次 ----------------
+week_pat = re.compile(r'(\d+)-(\d+)周(?:\((单|双)\))?')  # 5-16周(单)
+single_pat = re.compile(r'(?<!-)(?<!\d)(\d+)周')  # 11周
+
+
+def parse_weeks(cell: str, max_week: int = 20):
+    """返回 set，包含该单元格所有占用的周次"""
+    if pd.isna(cell) or str(cell).strip() == '':
+        return set()
+    txt = str(cell)
+    occupy = set()
+
+    # 匹配范围+单双
+    for m in week_pat.finditer(txt):
+        start, end = int(m.group(1)), int(m.group(2))
+        kind = m.group(3)
+        rng = range(start, end + 1)
+        if kind == '单':
+            occupy.update(x for x in rng if x % 2 == 1)
+        elif kind == '双':
+            occupy.update(x for x in rng if x % 2 == 0)
+        else:
+            occupy.update(rng)
+
+    # 匹配单个周次
+    txt_after = week_pat.sub('', txt)
+    for m in single_pat.finditer(txt_after):
+        w = int(m.group(1))
+        if 1 <= w <= max_week:
+            occupy.add(w)
+    return occupy
+
+
+# ---------------- 节次识别 ----------------
+def detect_section_label(row_idx: int):
+    """
+    行号 → 节次
+    2→1 上午第1节
+    3→2 上午第2节
+    4→3 下午第1节
+    5→4 下午第2节
+    """
+    mapping = {2: 1, 3: 2, 4: 3, 5: 4}
+    return mapping.get(row_idx)
+
+
+# ---------------- 解析课表 ----------------
+def parse_one_file(path):
+    df = pd.read_excel(path, sheet_name=0, header=None)
+
+    # 找到"节次"那一行
+    idxs = df[df.iloc[:, 0].astype(str).str.contains('节次', na=False)].index
+    if len(idxs) == 0:
+        raise ValueError(f"文件 {path} 中未找到'节次'行，请检查格式。")
+    header_idx = idxs[0]
+
+    # 星期列映射
+    days = ['星期一', '星期二', '星期三', '星期四', '星期五']
+    day_map = {}
+    headers = df.iloc[header_idx, :].tolist()
+    for col, h in enumerate(headers):
+        if pd.isna(h):
+            continue
+        text = str(h)
+        for d in days:
+            if d in text or d.replace('星期', '周') in text:
+                day_map[d] = col
+                break
+
+    # 节次行映射：直接按行号
+    section_map = {}
+    for r in range(header_idx + 1, len(df)):
+        sec = detect_section_label(r)
+        if sec is not None:
+            section_map[r] = sec
+
+    # 学生姓名
+    basename = os.path.splitext(os.path.basename(path))[0]
+    name = basename.split('-')[-1].strip() if '-' in basename else basename.strip()
+
+    # 计算空闲
+    free = {}
+    for r, sec in section_map.items():
+        for day_str, c in day_map.items():
+            if c >= df.shape[1]:
+                continue
+            cell = df.iloc[r, c]
+            occupy = parse_weeks(cell)
+            single_free = all(w not in occupy for w in range(1, 21, 2))
+            double_free = all(w not in occupy for w in range(2, 21, 2))
+            free[(name, day_str, sec)] = {'single': single_free, 'double': double_free}
+    return free
+
+
+# ---------------- 合并空闲表 ----------------
+def build_free_table(file_list):
+    all_free = defaultdict(lambda: {'single': True, 'double': True})
+    for f in file_list:
+        tmp = parse_one_file(f)
+        for k, v in tmp.items():
+            name, day, sec = k
+            all_free[(name, day, sec)]['single'] &= v['single']
+            all_free[(name, day, sec)]['double'] &= v['double']
+    return all_free
+
+
+# ---------------- 生成空课表 ----------------
+def make_empty_table(free_dict):
+    days = ['星期一', '星期二', '星期三', '星期四', '星期五']
+    sections = [1, 2, 3, 4]
+    single_df = pd.DataFrame(index=sections, columns=days)
+    double_df = pd.DataFrame(index=sections, columns=days)
+    for (name, day, sec), v in free_dict.items():
+        if day not in days or sec not in sections:
+            continue
+        if v['single']:
+            prev = single_df.at[sec, day]
+            single_df.at[sec, day] = name if pd.isna(prev) or prev == '' else f"{prev};{name}"
+        if v['double']:
+            prev = double_df.at[sec, day]
+            double_df.at[sec, day] = name if pd.isna(prev) or prev == '' else f"{prev};{name}"
+    single_df = single_df.fillna('')
+    double_df = double_df.fillna('')
+    return single_df, double_df
+
+
+# ---------------- 生成值班表（支持动态调整所有参数） ----------------
+def make_duty_schedule(free_dict, min_per_slot, max_per_slot, max_duty_per_person, min_duty_per_person):
+    """
+    使用改进的智能算法生成值班表，支持动态调整所有参数
+    """
+    # 配置参数 - 全部由前端传入
+    n_per_slot_min = min_per_slot  # 每个时间段最少需要安排的人数
+    n_per_slot_max = max_per_slot  # 每个时间段最多可以安排的人数
+    max_duty_per_person = max_duty_per_person  # 每人最多被安排几次值班
+    min_duty_per_person = min_duty_per_person  # 每人最少被安排几次值班
+
+    # 收集所有时间段及其候选人
+    candidates = defaultdict(list)
+    person_availability = defaultdict(list)  # 每个人的可用时间段
+
+    for (name, day, sec), v in free_dict.items():
+        if sec not in [1, 2, 3, 4]:
+            continue
+        if v['single']:
+            slot = (day, sec, True)
+            candidates[slot].append(name)
+            person_availability[name].append(slot)
+        if v['double']:
+            slot = (day, sec, False)
+            candidates[slot].append(name)
+            person_availability[name].append(slot)
+
+    # 计算每个人的可用时间段数量
+    person_availability_count = {name: len(slots) for name, slots in person_availability.items()}
+
+    # 计算每个时间段的候选人数
+    slot_candidate_count = {slot: len(names) for slot, names in candidates.items()}
+
+    # 按候选人数从少到多排序（贪心策略：先安排最难安排的时间段）
+    sorted_slots = sorted(slot_candidate_count.keys(), key=lambda x: slot_candidate_count[x])
+
+    # 初始化计数器
+    counter = Counter()
+    assigned_slots = defaultdict(list)  # 每个人被分配到的时间段
+
+    section_display = {1: '上午第1节', 2: '上午第2节',
+                       3: '下午第1节', 4: '下午第2节'}
+    rows = []
+
+    # 第一阶段：尝试为每个时间段安排最少人数
+    for slot in sorted_slots:
+        day, sec, week_is_single = slot
+        week_label = '单周' if week_is_single else '双周'
+        lst = candidates[slot]
+        display_sec = section_display[sec]
+
+        # 优先选择可用时间段较少且已值班次数较少的人
+        def pick_optimal_candidates(candidate_list, n):
+            if max_duty_per_person:
+                candidate_list = [name for name in candidate_list if counter[name] < max_duty_per_person]
+
+            if not candidate_list:
+                return []
+
+            # 综合考虑可用时间段数量和已值班次数
+            # 可用时间段越少的人优先级越低，已值班次数越少的人优先级越高
+            scored_candidates = []
+            for name in candidate_list:
+                # 评分公式：可用时间段数量（越高越好） - 已值班次数（越低越好）
+                score = person_availability_count[name] - counter[name]
+                scored_candidates.append((score, name))
+
+            # 按分数降序排列，选择分数最高的n个人
+            scored_candidates.sort(reverse=True)
+            return [name for _, name in scored_candidates[:n]]
+
+        # 首先尝试安排最少人数
+        names = pick_optimal_candidates(lst, n_per_slot_min)
+
+        if len(names) >= n_per_slot_min:
+            name_str = ', '.join(names)
+            rows.append([week_label, day, display_sec, name_str, len(names)])
+            for name in names:
+                counter[name] += 1
+                assigned_slots[name].append(slot)
+        else:
+            # 如果连最少人数都安排不了，尝试安排所有可用的人
+            names = pick_optimal_candidates(lst, len(lst))
+            if names:
+                name_str = ', '.join(names)
+                rows.append([week_label, day, display_sec, name_str, len(names)])
+                for name in names:
+                    counter[name] += 1
+                    assigned_slots[name].append(slot)
+            else:
+                rows.append([week_label, day, display_sec, '无人可排', 0])
+
+    # 第二阶段：为已安排的时间段增加人员（不超过最大人数限制）
+    for i, row in enumerate(rows):
+        if row[3] == '无人可排':
+            continue
+
+        week_label, day, display_sec, name_str, current_count = row
+        week_is_single = week_label == '单周'
+        sec = next(k for k, v in section_display.items() if v == display_sec)
+        slot = (day, sec, week_is_single)
+
+        # 如果当前人数少于最大人数，尝试增加人员
+        if current_count < n_per_slot_max:
+            lst = candidates[slot]
+
+            # 找出尚未被安排在这个时间段的人
+            current_names = name_str.split(', ')
+            available_candidates = [name for name in lst if
+                                    name not in current_names and counter[name] < max_duty_per_person]
+
+            # 计算还可以增加多少人
+            can_add = min(len(available_candidates), n_per_slot_max - current_count)
+
+            if can_add > 0:
+                # 优先选择值班次数少的人
+                available_candidates.sort(key=lambda name: counter[name])
+                additional_names = available_candidates[:can_add]
+
+                # 更新值班表
+                all_names = current_names + additional_names
+                rows[i][3] = ', '.join(all_names)
+                rows[i][4] = len(all_names)
+
+                # 更新计数器
+                for name in additional_names:
+                    counter[name] += 1
+                    assigned_slots[name].append(slot)
+
+    # 第三阶段：处理无人可排的时间段
+    # 找出无人可排的时间段
+    empty_slots = []
+    for i, row in enumerate(rows):
+        if row[3] == '无人可排':
+            week_label, day, display_sec, _, _ = row
+            # 找到对应的slot
+            week_is_single = week_label == '单周'
+            sec = next(k for k, v in section_display.items() if v == display_sec)
+            empty_slots.append((day, sec, week_is_single, i))
+
+    # 尝试为无人可排的时间段找到候选人
+    for day, sec, week_is_single, row_index in empty_slots:
+        slot = (day, sec, week_is_single)
+
+        # 找出所有在这个时间段有空的人
+        potential_candidates = candidates.get(slot, [])
+
+        # 如果没有候选人，尝试找到值班次数最少的人
+        if not potential_candidates:
+            # 找出所有值班次数少于最大值的人
+            available_people = [name for name in counter.keys() if counter[name] < max_duty_per_person]
+            if available_people:
+                # 选择值班次数最少的人
+                min_duty = min(counter[name] for name in available_people)
+                potential_candidates = [name for name in available_people if counter[name] == min_duty]
+
+        # 如果还是找不到候选人，放宽条件，找值班次数较少的人
+        if not potential_candidates and max_duty_per_person:
+            # 找出所有值班次数少于最大值+1的人（稍微放宽限制）
+            available_people = [name for name in counter.keys() if counter[name] < max_duty_per_person + 1]
+            if available_people:
+                # 选择值班次数最少的人
+                min_duty = min(counter[name] for name in available_people)
+                potential_candidates = [name for name in available_people if counter[name] == min_duty]
+
+        # 如果有候选人，安排他们
+        if potential_candidates:
+            # 只安排需要的数量（最少人数）
+            names = potential_candidates[:n_per_slot_min]
+            name_str = ', '.join(names)
+            rows[row_index][3] = f"{name_str} (调整后)"
+            rows[row_index][4] = len(names)
+
+            # 更新计数器
+            for name in names:
+                counter[name] += 1
+                assigned_slots[name].append(slot)
+
+    # 第四阶段：确保每个人至少有一定数量的值班
+    if min_duty_per_person > 0:
+        # 找出值班次数少于最小值的人
+        under_assigned = [name for name, count in counter.items() if count < min_duty_per_person]
+
+        for name in under_assigned:
+            # 找出这个人可用的时间段
+            available_slots = person_availability.get(name, [])
+
+            # 找出这些时间段中已经安排的人数较少的时间段
+            available_slots_with_count = []
+            for slot in available_slots:
+                # 找到这个时间段在rows中的索引
+                day, sec, week_is_single = slot
+                week_label = '单周' if week_is_single else '双周'
+                display_sec = section_display[sec]
+
+                for i, row in enumerate(rows):
+                    if row[0] == week_label and row[1] == day and row[2] == display_sec:
+                        # 检查这个时间段是否已经满员
+                        if row[3] != '无人可排' and '(调整后)' not in row[3] and row[4] < n_per_slot_max:
+                            current_count = row[4]
+                            available_slots_with_count.append((current_count, i, slot))
+                        break
+
+            # 按当前安排人数从少到多排序
+            available_slots_with_count.sort()
+
+            # 尝试在安排人数较少的时间段添加这个人
+            for _, row_index, slot in available_slots_with_count:
+                if counter[name] >= min_duty_per_person:
+                    break
+
+                current_names = rows[row_index][3].split(', ')
+                # 检查是否已经包含这个人
+                if name in current_names:
+                    continue
+
+                # 添加这个人
+                current_names.append(name)
+                rows[row_index][3] = ', '.join(current_names)
+                rows[row_index][4] = len(current_names)
+                counter[name] += 1
+                assigned_slots[name].append(slot)
+
+                if counter[name] >= min_duty_per_person:
+                    break
+
+    # 按周、星期、节次重新排序输出结果，方便查看
+    week_order = {'单周': 0, '双周': 1}
+    day_order = {'星期一': 0, '星期二': 1, '星期三': 2, '星期四': 3, '星期五': 4}
+    section_order = {'上午第1节': 0, '上午第2节': 1, '下午第1节': 2, '下午第2节': 3}
+
+    # 移除计数列
+    result_rows = [[row[0], row[1], row[2], row[3]] for row in rows]
+    result_rows.sort(key=lambda x: (week_order[x[0]], day_order[x[1]], section_order[x[2]]))
+
+    # 生成统计信息
+    total_slots = len(result_rows)
+    filled_slots = sum(1 for row in result_rows if row[3] != '无人可排')
+    total_people = len(counter)
+    avg_duty = sum(counter.values()) / total_people if total_people > 0 else 0
+
+    print(
+        f"排班统计: 总时间段 {total_slots}, 已安排 {filled_slots}, 参与人员 {total_people}, 平均值班次数 {avg_duty:.2f}")
+    print(f"每个时间段人数范围: {n_per_slot_min} - {n_per_slot_max}")
+    print(f"每人值班次数范围: {min_duty_per_person} - {max_duty_per_person}")
+
+    return pd.DataFrame(result_rows, columns=['周', '星期', '节次', '值班人'])
+
+
+# ---------------- 保存Excel文件 ----------------
+def save_to_excel(single_df, double_df, duty_df, filename=None):
+    """将三个表格保存到Excel文件的不同工作表"""
+    if filename is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"排班结果_{timestamp}.xlsx"
+
+    filepath = os.path.join(OUTPUT, filename)
+
+    with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+        single_df.to_excel(writer, sheet_name='单周空课表')
+        double_df.to_excel(writer, sheet_name='双周空课表')
+        duty_df.to_excel(writer, sheet_name='值班表')
+
+    return filepath, filename
+
+
+# ---------------- Flask 路由 ----------------
+@app.route('/')
+def index():
+    return render_template_string('''
+<!doctype html>
+<html>
+<head>
+    <title>空课表 & 值班表生成器</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: inline-block;
+            width: 250px;
+            font-weight: bold;
+        }
+        input[type="number"] {
+            width: 80px;
+            padding: 5px;
+        }
+        .help-text {
+            font-size: 12px;
+            color: #666;
+            margin-left: 10px;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .section {
+            margin-bottom: 25px;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        h2, h3 {
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <h2>空课表 & 值班表生成器</h2>
+    <form method="post" action="/upload" enctype="multipart/form-data">
+        <div class="section">
+            <h3>上传学生课表（支持多选 .xls/.xlsx）</h3>
+            <div class="form-group">
+                <input type="file" name="files" multiple required>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>值班人数设置</h3>
+            <div class="form-group">
+                <label for="min_per_slot">每个时间段最少值班人数:</label>
+                <input type="number" id="min_per_slot" name="min_per_slot" value="12" min="1" max="20" required>
+                <span class="help-text">每个时间段至少需要安排的人数</span>
+            </div>
+
+            <div class="form-group">
+                <label for="max_per_slot">每个时间段最多值班人数:</label>
+                <input type="number" id="max_per_slot" name="max_per_slot" value="16" min="1" max="30" required>
+                <span class="help-text">每个时间段最多可以安排的人数</span>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>个人值班次数设置</h3>
+            <div class="form-group">
+                <label for="min_duty_per_person">每人最少值班次数:</label>
+                <input type="number" id="min_duty_per_person" name="min_duty_per_person" value="1" min="0" max="10" required>
+                <span class="help-text">0表示不限制最少值班次数</span>
+            </div>
+
+            <div class="form-group">
+                <label for="max_duty_per_person">每人最多值班次数:</label>
+                <input type="number" id="max_duty_per_person" name="max_duty_per_person" value="2" min="1" max="20" required>
+                <span class="help-text">每人最多可以被安排几次值班</span>
+            </div>
+        </div>
+
+        <button type="submit">生成排班表</button>
+    </form>
+</body>
+</html>
+    ''')
+
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    files = request.files.getlist('files')
+
+    # 获取用户设置的所有参数
+    min_per_slot = int(request.form.get('min_per_slot', 12))
+    max_per_slot = int(request.form.get('max_per_slot', 16))
+    min_duty_per_person = int(request.form.get('min_duty_per_person', 1))
+    max_duty_per_person = int(request.form.get('max_duty_per_person', 2))
+
+    # 验证输入
+    if min_per_slot > max_per_slot:
+        return "<h3>错误：最少值班人数不能大于最多值班人数</h3>", 400
+
+    if min_duty_per_person > max_duty_per_person:
+        return "<h3>错误：每人最少值班次数不能大于最多值班次数</h3>", 400
+
+    saved = []
+    for f in files:
+        if f.filename == '':
+            continue
+        path = os.path.join(UPLOAD, f.filename)
+        f.save(path)
+        saved.append(path)
+
+    try:
+        free_dict = build_free_table(saved)
+        single_df, double_df = make_empty_table(free_dict)
+        duty_df = make_duty_schedule(free_dict, min_per_slot, max_per_slot, max_duty_per_person, min_duty_per_person)
+
+        # 保存到Excel文件
+        filepath, filename = save_to_excel(single_df, double_df, duty_df)
+
+    except Exception as e:
+        return f"<h3>解析出错：{e}</h3>", 400
+    finally:
+        for p in saved:
+            if os.path.exists(p):
+                os.remove(p)
+
+    return render_template_string('''
+<!doctype html>
+<html>
+<head>
+    <title>结果</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .table {
+            border-collapse: collapse;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        .table, .table th, .table td {
+            border: 1px solid #ddd;
+            padding: 8px;
+        }
+        .table th {
+            background-color: #f2f2f2;
+        }
+        .btn-primary {
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            display: inline-block;
+            margin: 10px 0;
+        }
+        .btn-primary:hover {
+            background: #0056b3;
+        }
+        .param-summary {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h2>生成结果</h2>
+
+    <div class="param-summary">
+        <h3>使用的参数</h3>
+        <p>每个时间段值班人数: {{ min_per_slot }} - {{ max_per_slot }} 人</p>
+        <p>每人值班次数: {{ min_duty_per_person }} - {{ max_duty_per_person }} 次</p>
+    </div>
+
+    <h3>单周空课表</h3>
+    {{ single_html|safe }}
+
+    <h3>双周空课表</h3>
+    {{ double_html|safe }}
+
+    <h3>值班表</h3>
+    {{ duty_html|safe }}
+
+    <br>
+    <div>
+        <a href="/download/{{ filename }}" class="btn-primary">
+            下载Excel文件
+        </a>
+    </div>
+
+    <a href="/">返回上传页面</a>
+</body>
+</html>
+    ''',
+                                  single_html=single_df.to_html(classes='table', border=1, index=True),
+                                  double_html=double_df.to_html(classes='table', border=1, index=True),
+                                  duty_html=duty_df.to_html(classes='table', border=1, index=False),
+                                  filename=filename,
+                                  min_per_slot=min_per_slot,
+                                  max_per_slot=max_per_slot,
+                                  min_duty_per_person=min_duty_per_person,
+                                  max_duty_per_person=max_duty_per_person
+                                  )
+
+
+@app.route('/download/<filename>')
+def download_file(filename):
+    """下载生成的Excel文件"""
+    filepath = os.path.join(OUTPUT, filename)
+
+    # 检查文件是否存在
+    if not os.path.exists(filepath):
+        return "文件不存在或已过期", 404
+
+    # 发送文件
+    return send_file(
+        filepath,
+        as_attachment=True,
+        download_name=filename,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+
+# ---------------- 清理旧文件 ----------------
+def cleanup_old_files():
+    """清理outputs文件夹中超过1小时的文件"""
+    now = datetime.now()
+    for filename in os.listdir(OUTPUT):
+        filepath = os.path.join(OUTPUT, filename)
+        if os.path.isfile(filepath):
+            file_time = datetime.fromtimestamp(os.path.getctime(filepath))
+            if (now - file_time).total_seconds() > 3600:  # 1小时
+                os.remove(filepath)
+
+
+# ---------------- 启动 ----------------
+if __name__ == '__main__':
+    # 启动时清理旧文件
+    cleanup_old_files()
+    app.run(debug=True)
